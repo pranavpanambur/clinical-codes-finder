@@ -1,7 +1,9 @@
 import os
+import time
+import logging
 from pathlib import Path
 from collections import defaultdict
-import asyncio  # NEW
+import asyncio
 from dotenv import load_dotenv
 
 from fastapi import FastAPI
@@ -13,18 +15,24 @@ from .models import SearchRequest, SearchResponse, CodeItem
 from . import clients, rank, summarize
 
 
-# === Load environment variables ===
+# Load environment variables 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 TOP_K = int(os.getenv("TOP_K", "10"))  # configurable number of top results
 
-# === FastAPI setup ===
+# Logging 
+logger = logging.getLogger("clinical_codes_finder")
+# enable a config:
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+# FastAPI setup
 app = FastAPI(title="Clinical Codes Finder")
 
 @app.on_event("startup")
 def _log_api_key_presence():
-    print(f"OPENAI_API_KEY present? {bool(os.getenv('OPENAI_API_KEY'))}", flush=True)
+    logger.info(f"OPENAI_API_KEY present? {bool(os.getenv('OPENAI_API_KEY'))}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +42,7 @@ app.add_middleware(
 )
 
 
-# === Helper to group results by coding system ===
+# Helper to group results by coding system
 def _group_by_system(items):
     grouped = defaultdict(list)
     for it in items:
@@ -42,7 +50,7 @@ def _group_by_system(items):
     return dict(grouped)
 
 
-# === Lightweight retry helper for flaky upstreams ===
+# Lightweight retry helper for flaky upstreams 
 async def _with_retry(fn, session, query, attempts: int = 2, base_delay: float = 0.5):
     """
     Calls one client function (like clients.search_icd10cm) with small retries.
@@ -65,15 +73,13 @@ async def _with_retry(fn, session, query, attempts: int = 2, base_delay: float =
     return []
 
 
-# === Main search endpoint ===
+# Main search endpoint 
 @app.post("/search", response_model=SearchResponse)
 async def search(req: SearchRequest):
     query = req.query.strip()
+    start = time.perf_counter()
 
     async with httpx.AsyncClient(timeout=15) as session:
-        results = []
-
-        # Define sources as callables so we can pass them into the retry helper
         sources = [
             clients.search_icd10cm,
             clients.search_loinc_items,
@@ -83,20 +89,22 @@ async def search(req: SearchRequest):
             clients.search_hpo,
         ]
 
-        # Run them one-by-one with a small retry (simple & reliable)
-        for fn in sources:
-            try:
-                items = await _with_retry(fn, session, query, attempts=2, base_delay=0.5)
-                if items:
-                    results.extend(items)
-            except Exception:
-                # keep going even if one source fails
-                pass
+        # Run ALL source calls in PARALLEL with small retries
+        tasks = [
+            _with_retry(fn, session, query, attempts=2, base_delay=0.5)
+            for fn in sources
+        ]
+        results = []
+        results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results_lists:
+            if isinstance(r, list):
+                results.extend(r)
+            
 
     # Rank
     top = rank.rank_top(query, results, k=TOP_K)
 
-    # Summarize (but never fail the whole request if LLM hiccups)
+    # Summarize 
     try:
         summary = await summarize.llm_summary(query, top)
     except Exception:
@@ -105,10 +113,14 @@ async def search(req: SearchRequest):
     # Group results by system for easier UI use
     grouped = _group_by_system(top)
 
+    # Log one concise line with latency + counts
+    elapsed = time.perf_counter() - start
+    logger.info(f"query={query!r} results={len(results)} top={len(top)} elapsed={elapsed:.2f}s")
+
     return SearchResponse(results=top, summary=summary, grouped=grouped)
 
 
-# === Health check endpoint ===
+# Health check endpoint
 @app.get("/health/env")
 def health_env():
     key = os.getenv("OPENAI_API_KEY", "")

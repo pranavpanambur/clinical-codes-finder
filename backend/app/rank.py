@@ -7,10 +7,10 @@ from typing import List, Tuple, Optional, Set
 
 from .models import CodeItem
 
-# Model can be overridden via .env (OPENAI_MODEL)
+# Model can be overridden via .env 
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Try to enable LLM; if anything’s missing we’ll just use the heuristic
+
 try:
     from langchain_openai import ChatOpenAI
     from langchain.prompts import ChatPromptTemplate
@@ -19,9 +19,7 @@ except Exception:
     _HAS_LLM = False
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
+
 
 def _dedupe(items: List[CodeItem]) -> List[CodeItem]:
     """Remove duplicates by (system, code) while preserving order."""
@@ -54,11 +52,8 @@ def _heuristic_top_k(query: str, items: List[CodeItem], k: int) -> List[CodeItem
     return [it for _, _, it in scored[:k]]
 
 
-# ----------------------------
-# LLM selection
-# ----------------------------
 
-# Prompt: force a strict JSON array of indices, nothing else
+
 _PROMPT = None
 if _HAS_LLM:
     _PROMPT = ChatPromptTemplate.from_template(
@@ -121,9 +116,7 @@ def _llm_select_indices(query: str, items: List[CodeItem], k: int) -> Optional[L
         return None
 
 
-# ----------------------------
-# Public API
-# ----------------------------
+
 
 def rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
     """
@@ -133,7 +126,7 @@ def rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
     # Deduplicate first so both LLM and heuristic see clean candidates
     base = _dedupe(items)
 
-    # Try LLM selection (best-effort)
+    # Try LLM selection 
     try:
         idxs = _llm_select_indices(query, base, k)
         if idxs:
@@ -141,8 +134,7 @@ def rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
             # Dedupe once more in case indices still include near-dupes
             return _dedupe(chosen)[:k]
     except Exception:
-        # Any LLM error -> fallback
         pass
 
-    # Fallback heuristic (deterministic)
+    # Fallback heuristic 
     return _heuristic_top_k(query, base, k)
