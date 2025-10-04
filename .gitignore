@@ -1,0 +1,9 @@
+.env
+*.env
+.env.*
+__pycache__/
+*.pyc
+.vscode/
+.venv/
+.DS_Store
+frontend/node_modules/

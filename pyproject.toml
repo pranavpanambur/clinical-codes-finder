@@ -1,0 +1,10 @@
+
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "clinical-codes-finder"
+version = "0.1.0"
+description = "Search clinical coding systems via NLM Clinical Tables + LLM summarization"
+authors = [{name="Pranav Muralidhar Rao"}]
+dependencies = []

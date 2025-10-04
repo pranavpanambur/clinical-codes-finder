@@ -1,0 +1,80 @@
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clinical Codes Finder</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; max-width: 880px; margin: 24px auto; padding: 0 16px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 16px; padding: 16px; margin: 12px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.03); }
+      .row { display: flex; gap: 10px; align-items: center; }
+      input[type=text] { flex: 1; padding: 12px 14px; border-radius: 12px; border: 1px solid #cbd5e1; font-size: 16px; }
+      button { padding: 10px 14px; border-radius: 12px; border: 1px solid #0ea5e9; background: white; cursor: pointer; }
+      button:hover { background: #f0f9ff; }
+      code { background: #f8fafc; padding: 2px 6px; border-radius: 6px; }
+      .muted { color: #6b7280; }
+      .grid { display: grid; grid-template-columns: repeat( auto-fit, minmax(240px, 1fr) ); gap: 12px; }
+      .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #e5e7eb; font-size: 12px; margin-right: 6px; }
+      .sys { font-weight: 600; }
+      .small { font-size: 12px; }
+      .summary { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>🩺 Clinical Codes Finder</h1>
+    <p class="muted">Enter a clinical phrase, then I'll fetch and rank code candidates across ICD-10-CM, LOINC, RxTerms, HCPCS, UCUM, and HPO.</p>
+
+    <div class="card">
+      <div class="row">
+        <input id="q" type="text" placeholder="e.g., glucose test, metformin 500 mg, ataxia" />
+        <button id="go">Search</button>
+      </div>
+    </div>
+
+    <div id="out"></div>
+
+    <script>
+      const out = document.getElementById('out');
+      const q = document.getElementById('q');
+      document.getElementById('go').onclick = async () => {
+        const query = q.value.trim();
+        if (!query) return;
+        out.innerHTML = '<div class="card">Searching…</div>';
+        try {
+          const res = await fetch('http://localhost:8000/search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({query})
+          });
+          const data = await res.json();
+          const groups = {};
+          (data.results || []).forEach(r => {
+            groups[r.system] = groups[r.system] || [];
+            groups[r.system].push(r);
+          });
+          const htmlGroups = Object.entries(groups).map(([sys, items]) => `
+            <div class="card">
+              <div class="sys">${sys}</div>
+              <div class="grid">
+                ${items.map(i => `
+                  <div class="card">
+                    <div><span class="tag">${i.system}</span> <code>${i.code}</code></div>
+                    <div>${i.display || ''}</div>
+                    ${i.extras && Object.keys(i.extras).length ? `<div class="small muted">${Object.entries(i.extras).map(([k,v]) => `<span class="tag">${k}: ${Array.isArray(v) ? v.join(' | ') : v}</span>`).join(' ')}</div>` : ''}
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          `).join('');
+          out.innerHTML = `
+            <div class="card summary"><strong>Summary</strong><br/>${(data.summary || '').replaceAll('\n','<br/>')}</div>
+            ${htmlGroups || ''}
+          `;
+        } catch (e) {
+          out.innerHTML = '<div class="card">Error: ' + (e.message || e) + '</div>';
+        }
+      };
+    </script>
+  </body>
+</html>
