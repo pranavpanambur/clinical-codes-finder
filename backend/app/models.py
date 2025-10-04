@@ -14,3 +14,4 @@ class SearchRequest(BaseModel):
 class SearchResponse(BaseModel):
     results: List[CodeItem]
     summary: str
+    grouped: Optional[Dict[str, List[CodeItem]]] = None
