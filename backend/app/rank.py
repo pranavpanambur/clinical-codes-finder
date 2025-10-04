@@ -1,86 +1,148 @@
+from __future__ import annotations
 
-from typing import List
-from difflib import SequenceMatcher
-from .models import CodeItem
-from typing import Dict, Tuple, List
-from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
+import os
 import json
+import difflib
+from typing import List, Tuple, Optional, Set
+
+from .models import CodeItem
+
+# Model can be overridden via .env (OPENAI_MODEL)
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Try to enable LLM; if anything’s missing we’ll just use the heuristic
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import ChatPromptTemplate
+    _HAS_LLM = bool(os.getenv("OPENAI_API_KEY"))
+except Exception:
+    _HAS_LLM = False
 
 
-def score(query: str, item: CodeItem) -> float:
-    q = query.lower().strip()
-    text = f"{item.code} {item.display}".lower()
-    return SequenceMatcher(None, q, text).ratio()
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def _dedupe(items: List[CodeItem]) -> List[CodeItem]:
+    """Remove duplicates by (system, code) while preserving order."""
+    seen: Set[Tuple[str, str]] = set()
+    out: List[CodeItem] = []
+    for it in items:
+        key = (it.system, it.code)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+def _heuristic_score(query: str, item: CodeItem) -> float:
+    """Simple lexical similarity score as fallback."""
+    q = (query or "").lower().strip()
+    fields = " ".join([item.system or "", item.code or "", item.display or ""]).lower()
+    return difflib.SequenceMatcher(None, q, fields).ratio()
+
+
+def _heuristic_top_k(query: str, items: List[CodeItem], k: int) -> List[CodeItem]:
+    """Deterministic heuristic ranking with dedupe and stable tie-breaks."""
+    deduped = _dedupe(items)
+    scored = []
+    for idx, it in enumerate(deduped):
+        scored.append((_heuristic_score(query, it), idx, it))
+    # Sort by score desc, then by original order asc
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [it for _, _, it in scored[:k]]
+
+
+# ----------------------------
+# LLM selection
+# ----------------------------
+
+# Prompt: force a strict JSON array of indices, nothing else
+_PROMPT = None
+if _HAS_LLM:
+    _PROMPT = ChatPromptTemplate.from_template(
+        """
+You are selecting the most relevant clinical codes for a user query.
+
+Return ONLY a JSON array of UNIQUE integer indices, no text before/after.
+Rules:
+- Consider semantic relevance to the query.
+- Deduplicate by (system, code).
+- Select at most {k} items.
+- If multiple items are near-duplicates, prefer ICD-10-CM for diagnoses, LOINC for labs, RxTerms for meds, HPO for phenotypes.
+- Output strictly: [0, 3, 5]  (JSON array of integers)
+
+User query: "{query}"
+
+Items (index · system · code · display):
+{lines}
+""".strip()
+    )
+
+
+def _format_items_for_prompt(items: List[CodeItem]) -> str:
+    lines = []
+    for i, it in enumerate(items):
+        disp = (it.display or "").replace("\n", " ").strip()
+        lines.append(f"{i} · {it.system} · {it.code} · {disp}")
+    return "\n".join(lines)
+
+
+def _llm_select_indices(query: str, items: List[CodeItem], k: int) -> Optional[List[int]]:
+    """Ask the LLM to return a JSON array of indices; validate strictly."""
+    if not _HAS_LLM or not items or _PROMPT is None:
+        return None
+
+    llm = ChatOpenAI(model=_OPENAI_MODEL, temperature=0)
+    msg = _PROMPT.format_messages(
+        query=query,
+        k=k,
+        lines=_format_items_for_prompt(items),
+    )
+    resp = llm.invoke(msg)
+    text = (getattr(resp, "content", None) or "").strip()
+
+    # try to parse JSON array safely
+    try:
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            return None
+        out: List[int] = []
+        seen: Set[int] = set()
+        for v in parsed:
+            if isinstance(v, int) and 0 <= v < len(items) and v not in seen:
+                out.append(v)
+                seen.add(v)
+            if len(out) >= k:
+                break
+        return out or None
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Public API
+# ----------------------------
 
 def rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
-    dedup = {}
-    for it in items:
-        key = (it.system, it.code)
-        if key not in dedup:
-            dedup[key] = it
-    scored = sorted(dedup.values(), key=lambda it: score(query, it), reverse=True)
-    return scored[:k]
-
-class RankingSelection(BaseModel):
-    system: str = Field(..., description="Coding system")
-    code: str = Field(..., description="Code identifier")
-
-RANK_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a clinical coding assistant. Choose the MOST relevant Top-{k} codes for the user query. "
-     "Return STRICT JSON like {\"selected\": [{\"system\": str, \"code\": str}, ...]} with exactly {k} items. "
-     "Prefer precise clinical matches over vague ones. Avoid duplicates."),
-    ("user",
-     "Query: {query}\n\nCandidates (JSON list):\n{candidates_json}\n\n"
-     "Select the {k} best codes by (system, code) only. No extra text.")
-])
-
-def llm_rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
     """
-    Uses an LLM to choose Top-K most relevant codes.
-    Falls back to heuristic rank_top on any error or malformed output.
+    Returns top-k CodeItem using LLM selection with strict JSON parsing,
+    falling back to a deterministic heuristic ranking.
     """
-    # de-duplicate by (system, code)
-    dedup: Dict[Tuple[str, str], CodeItem] = {}
-    for it in items:
-        key = (it.system, it.code)
-        if key not in dedup:
-            dedup[key] = it
-    uniques = list(dedup.values())
-    if not uniques:
-        return []
-    if len(uniques) <= k:
-        return uniques
+    # Deduplicate first so both LLM and heuristic see clean candidates
+    base = _dedupe(items)
 
-    candidates = [
-        {"system": it.system, "code": it.code, "display": it.display[:300]}
-        for it in uniques
-    ]
-    candidates_json = json.dumps(candidates, ensure_ascii=False)
-
+    # Try LLM selection (best-effort)
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        prompt_msgs = RANK_PROMPT.format_messages(query=query, candidates_json=candidates_json, k=k)
-        resp = llm.invoke(prompt_msgs)
-        content = getattr(resp, "content", "") or str(resp)
-        data = json.loads(content)
-        selected = data.get("selected", [])
-        # map back to CodeItem
-        index = {(it.system, it.code): it for it in uniques}
-        out, seen = [], set()
-        for sel in selected:
-            key = (sel.get("system"), sel.get("code"))
-            if key in index and key not in seen:
-                out.append(index[key]); seen.add(key)
-        # top-up if fewer than k
-        if len(out) < k:
-            from .rank import rank_top as _heur
-            topup = [x for x in _heur(query, uniques, k=k*2) if (x.system, x.code) not in seen][: k - len(out)]
-            out.extend(topup)
-        return out[:k]
+        idxs = _llm_select_indices(query, base, k)
+        if idxs:
+            chosen = [base[i] for i in idxs]
+            # Dedupe once more in case indices still include near-dupes
+            return _dedupe(chosen)[:k]
     except Exception:
-        # fallback: your existing heuristic
-        from .rank import rank_top as _heur
-        return _heur(query, uniques, k=k)
+        # Any LLM error -> fallback
+        pass
+
+    # Fallback heuristic (deterministic)
+    return _heuristic_top_k(query, base, k)
