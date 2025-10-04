@@ -1,76 +1,86 @@
-from __future__ import annotations
-from typing import List, Dict, Any, Tuple
-import os, json, re
+
+from typing import List
+from difflib import SequenceMatcher
+from .models import CodeItem
+from typing import Dict, Tuple, List
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+import json
 
-def _kw_score(item: Dict[str, Any], query: str) -> Tuple[int, int]:
-    """Heuristic: count matching tokens; tie-break by shorter display."""
-    text = " ".join([
-        item.get("system",""), item.get("code",""),
-        item.get("display",""), json.dumps(item.get("extras", {}))
-    ]).lower()
-    toks = set(re.findall(r"\w+", query.lower()))
-    hits = sum(tok in text for tok in toks)
-    return (hits, -len(item.get("display","")))
 
-def _heuristic_top_k(query: str, items: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-    ranked = sorted(items, key=lambda it: _kw_score(it, query), reverse=True)
-    seen = set()
-    dedup = []
-    for it in ranked:
-        key = (it.get("system"), it.get("code"))
-        if key not in seen:
-            seen.add(key)
-            dedup.append(it)
-        if len(dedup) >= k:
-            break
-    return dedup
+def score(query: str, item: CodeItem) -> float:
+    q = query.lower().strip()
+    text = f"{item.code} {item.display}".lower()
+    return SequenceMatcher(None, q, text).ratio()
 
-def rank_top_k(query: str, items: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
+def rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
+    dedup = {}
+    for it in items:
+        key = (it.system, it.code)
+        if key not in dedup:
+            dedup[key] = it
+    scored = sorted(dedup.values(), key=lambda it: score(query, it), reverse=True)
+    return scored[:k]
+
+class RankingSelection(BaseModel):
+    system: str = Field(..., description="Coding system")
+    code: str = Field(..., description="Code identifier")
+
+RANK_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a clinical coding assistant. Choose the MOST relevant Top-{k} codes for the user query. "
+     "Return STRICT JSON like {\"selected\": [{\"system\": str, \"code\": str}, ...]} with exactly {k} items. "
+     "Prefer precise clinical matches over vague ones. Avoid duplicates."),
+    ("user",
+     "Query: {query}\n\nCandidates (JSON list):\n{candidates_json}\n\n"
+     "Select the {k} best codes by (system, code) only. No extra text.")
+])
+
+def llm_rank_top(query: str, items: List[CodeItem], k: int = 10) -> List[CodeItem]:
     """
-    Use the LLM to select the K most relevant codes across all systems.
-    Falls back to a deterministic heuristic if LLM is unavailable or errors.
+    Uses an LLM to choose Top-K most relevant codes.
+    Falls back to heuristic rank_top on any error or malformed output.
     """
-    if not items:
+    # de-duplicate by (system, code)
+    dedup: Dict[Tuple[str, str], CodeItem] = {}
+    for it in items:
+        key = (it.system, it.code)
+        if key not in dedup:
+            dedup[key] = it
+    uniques = list(dedup.values())
+    if not uniques:
         return []
+    if len(uniques) <= k:
+        return uniques
 
-    # Try LLM selection
+    candidates = [
+        {"system": it.system, "code": it.code, "display": it.display[:300]}
+        for it in uniques
+    ]
+    candidates_json = json.dumps(candidates, ensure_ascii=False)
+
     try:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY not set")
-
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        llm = ChatOpenAI(model=model_name, temperature=0)
-
-        # keep prompt bounded
-        subset = items[:120]
-        compact = [
-            {"system": it.get("system",""), "code": it.get("code",""), "display": it.get("display","")}
-            for it in subset
-        ]
-
-        prompt = (
-            "You are selecting the most clinically relevant codes for a user's query.\n"
-            f"Query: {query}\n\n"
-            f"From the list below, return up to {k} selections that best match the query.\n"
-            "Return ONLY a JSON array of objects with keys 'system' and 'code'. No extra text.\n"
-            "Prefer standard/common codes, exact term matches, and high clinical relevance.\n\n"
-            f"Items:\n{json.dumps(compact, ensure_ascii=False)}\n"
-        )
-
-        raw = llm.invoke(prompt).content
-        chosen = json.loads(raw)  # must be a JSON array
-        want = {(x.get("system"), x.get("code")) for x in chosen if isinstance(x, dict)}
-
-        picked = [it for it in subset if (it.get("system"), it.get("code")) in want]
-
-        # pad if LLM returns fewer than k
-        if len(picked) < k:
-            pad = [it for it in _heuristic_top_k(query, subset, k)
-                   if (it.get("system"), it.get("code")) not in want]
-            picked = (picked + pad)[:k]
-
-        return picked
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        prompt_msgs = RANK_PROMPT.format_messages(query=query, candidates_json=candidates_json, k=k)
+        resp = llm.invoke(prompt_msgs)
+        content = getattr(resp, "content", "") or str(resp)
+        data = json.loads(content)
+        selected = data.get("selected", [])
+        # map back to CodeItem
+        index = {(it.system, it.code): it for it in uniques}
+        out, seen = [], set()
+        for sel in selected:
+            key = (sel.get("system"), sel.get("code"))
+            if key in index and key not in seen:
+                out.append(index[key]); seen.add(key)
+        # top-up if fewer than k
+        if len(out) < k:
+            from .rank import rank_top as _heur
+            topup = [x for x in _heur(query, uniques, k=k*2) if (x.system, x.code) not in seen][: k - len(out)]
+            out.extend(topup)
+        return out[:k]
     except Exception:
-        # deterministic fallback
-        return _heuristic_top_k(query, items, k)
+        # fallback: your existing heuristic
+        from .rank import rank_top as _heur
+        return _heur(query, uniques, k=k)
